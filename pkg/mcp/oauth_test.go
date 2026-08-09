@@ -9,10 +9,30 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"golang.org/x/oauth2"
 )
+
+type recordingTokenStorage struct {
+	config *oauth2.Config
+	token  *oauth2.Token
+}
+
+func (r *recordingTokenStorage) GetTokenConfig(context.Context, string) (*oauth2.Config, *oauth2.Token, error) {
+	return r.config, r.token, nil
+}
+
+func (r *recordingTokenStorage) SetTokenConfig(_ context.Context, _ string, config *oauth2.Config, token *oauth2.Token) error {
+	r.config = config
+	r.token = token
+	return nil
+}
+
+func (*recordingTokenStorage) DeleteTokenConfig(context.Context, string) error {
+	return nil
+}
 
 func TestGetOAuthMetadata(t *testing.T) {
 	var serverURL string
@@ -487,5 +507,79 @@ func TestAuthCodeURLRequestsOfflineAccessForEntra(t *testing.T) {
 				t.Fatalf("AuthCodeURL mutated the caller's scopes: got %v, want %v", conf.Scopes, tt.scopes)
 			}
 		})
+	}
+}
+
+func TestExpiredStoredTokenRefreshesBeforeProtectedRequest(t *testing.T) {
+	var tokenRequests, protectedRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/token":
+			tokenRequests.Add(1)
+			if err := req.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Form.Get("grant_type") != "refresh_token" {
+				http.Error(w, "expected refresh_token grant", http.StatusBadRequest)
+				return
+			}
+			if req.Form.Get("refresh_token") != "entra-refresh-token" {
+				http.Error(w, "missing stored refresh token", http.StatusBadRequest)
+				return
+			}
+			if req.Form.Has("scope") {
+				http.Error(w, "refresh request unexpectedly included scope", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"renewed-access-token","token_type":"Bearer","expires_in":3600,"refresh_token":"rotated-refresh-token"}`))
+		case "/mcp":
+			protectedRequests.Add(1)
+			if req.Header.Get("Authorization") != "Bearer renewed-access-token" {
+				http.Error(w, "request did not use refreshed access token", http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	storage := &recordingTokenStorage{}
+	config := &oauth2.Config{
+		ClientID: "entra-client-id",
+		Endpoint: oauth2.Endpoint{
+			TokenURL:  server.URL + "/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+	}
+	expired := &oauth2.Token{
+		AccessToken:  "expired-access-token",
+		RefreshToken: "entra-refresh-token",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+
+	client := oauth2.NewClient(t.Context(), newTokenSource(t.Context(), storage, server.URL+"/mcp", config, expired))
+	response, err := client.Get(server.URL + "/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("unexpected protected-resource status: %s", response.Status)
+	}
+	if tokenRequests.Load() != 1 {
+		t.Fatalf("expected one refresh request, got %d", tokenRequests.Load())
+	}
+	if protectedRequests.Load() != 1 {
+		t.Fatalf("expected one protected request, got %d", protectedRequests.Load())
+	}
+	if storage.token == nil || storage.token.AccessToken != "renewed-access-token" || storage.token.RefreshToken != "rotated-refresh-token" {
+		t.Fatalf("refreshed token was not persisted: %#v", storage.token)
 	}
 }
