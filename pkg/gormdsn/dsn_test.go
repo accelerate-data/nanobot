@@ -52,6 +52,14 @@ func TestNewDBFromDSNLogsPlaceholdersNotBoundValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newDBFromDSN: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB: %v", err)
+	}
+	// A bare :memory: database is per-connection; pin the pool so the
+	// duplicate-key precondition below stays on one connection.
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	type sample struct {
 		ID    uint

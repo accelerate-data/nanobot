@@ -20,10 +20,7 @@ func NewDBFromDSN(dsn string) (*gorm.DB, error) {
 }
 
 // newDBFromDSN opens the database identified by dsn, writing GORM's query log
-// to logOutput. Bound parameter values are never logged: session configs carry
-// decrypted MCP credentials (bearer tokens, OAuth client secrets), and GORM
-// interpolates every bound value into the SQL it logs unless the logger is
-// parameterized. See newLogger.
+// to logOutput. See newLogger for why bound values are left out of that log.
 func newDBFromDSN(dsn string, logOutput io.Writer) (*gorm.DB, error) {
 	var dialector gorm.Dialector
 
@@ -50,10 +47,11 @@ func newDBFromDSN(dsn string, logOutput io.Writer) (*gorm.DB, error) {
 }
 
 // newLogger returns a GORM logger that deliberately omits bound parameter
-// values from every log line (slow queries and errors alike). GORM only
-// substitutes values into the logged SQL when its logger implements
-// logger.ParamsFilter without ParameterizedQueries set, so setting the flag
-// keeps the query shape and timing while leaving the values as placeholders.
+// values from its slow-query and error log lines. Session updates write
+// decrypted MCP credentials (bearer tokens, OAuth client secrets) and GORM
+// interpolates every bound value into the SQL it logs unless the logger is
+// parameterized, so the flag keeps the query shape and timing while leaving
+// the values as placeholders.
 func newLogger(logOutput io.Writer) logger.Interface {
 	return logger.New(log.New(logOutput, "\r\n", log.LstdFlags), logger.Config{
 		SlowThreshold:             200 * time.Millisecond,
